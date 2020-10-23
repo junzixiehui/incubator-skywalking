@@ -18,91 +18,78 @@
 
 package org.apache.skywalking.oap.server.cluster.plugin.kubernetes;
 
-import com.google.common.collect.Lists;
-import com.google.common.util.concurrent.*;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.function.Supplier;
-import javax.annotation.Nullable;
-import org.apache.skywalking.oap.server.core.cluster.*;
+import io.kubernetes.client.openapi.models.V1ObjectMeta;
+import io.kubernetes.client.openapi.models.V1Pod;
+import io.kubernetes.client.openapi.models.V1PodStatus;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.skywalking.oap.server.core.CoreModule;
+import org.apache.skywalking.oap.server.core.cluster.ClusterNodesQuery;
+import org.apache.skywalking.oap.server.core.cluster.ClusterRegister;
+import org.apache.skywalking.oap.server.core.cluster.RemoteInstance;
+import org.apache.skywalking.oap.server.core.cluster.ServiceRegisterException;
+import org.apache.skywalking.oap.server.core.config.ConfigService;
 import org.apache.skywalking.oap.server.core.remote.client.Address;
-import org.apache.skywalking.oap.server.telemetry.api.TelemetryRelatedContext;
-import org.slf4j.*;
+import org.apache.skywalking.oap.server.library.module.ModuleDefineHolder;
 
 /**
- * Read collector pod info from api-server of kubernetes, then using all containerIp list to
- * construct the list of {@link RemoteInstance}.
- *
- * @author gaohongtao
+ * Read collector pod info from api-server of kubernetes, then using all containerIp list to construct the list of
+ * {@link RemoteInstance}.
  */
+@Slf4j
 public class KubernetesCoordinator implements ClusterRegister, ClusterNodesQuery {
 
-    private static final Logger logger = LoggerFactory.getLogger(KubernetesCoordinator.class);
+    private final ModuleDefineHolder manager;
+
+    private volatile int port = -1;
 
     private final String uid;
 
-    private final Map<String, RemoteInstance> cache = new ConcurrentHashMap<>();
-
-    private final ReusableWatch<Event> watch;
-
-    private int port;
-
-    KubernetesCoordinator(final ReusableWatch<Event> watch, final Supplier<String> uidSupplier) {
-        this.watch = watch;
-        this.uid = uidSupplier.get();
-        TelemetryRelatedContext.INSTANCE.setId(uid);
+    public KubernetesCoordinator(final ModuleDefineHolder manager,
+                                 final ClusterModuleKubernetesConfig config) {
+        this.uid = new UidEnvSupplier(config.getUidEnvName()).get();
+        this.manager = manager;
     }
 
-    @Override public void registerRemote(RemoteInstance remoteInstance) throws ServiceRegisterException {
-        this.port = remoteInstance.getAddress().getPort();
-        submitTask(MoreExecutors.listeningDecorator(Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
-            .setDaemon(true).setNameFormat("Kubernetes-ApiServer-%s").build())));
-    }
+    @Override
+    public List<RemoteInstance> queryRemoteNodes() {
 
-    private void submitTask(final ListeningExecutorService service) {
-        watch.initOrReset();
-        ListenableFuture<?> watchFuture = service.submit(newWatch());
-        Futures.addCallback(watchFuture, new FutureCallback<Object>() {
-            @Override public void onSuccess(@Nullable Object ignored) {
-                submitTask(service);
-            }
+        List<V1Pod> pods = NamespacedPodListInformer.INFORMER.listPods().orElseGet(this::selfPod);
 
-            @Override public void onFailure(@Nullable Throwable throwable) {
-                logger.debug("Generate remote nodes error", throwable);
-                submitTask(service);
-            }
-        });
-    }
-
-    private Callable<Object> newWatch() {
-        return () -> {
-            generateRemoteNodes();
-            return null;
-        };
-    }
-
-    private void generateRemoteNodes() {
-        for (Event event : watch) {
-            if (event == null) {
-                break;
-            }
-            logger.debug("Received event {} {}-{}", event.getType(), event.getUid(), event.getHost());
-            switch (event.getType()) {
-                case "ADDED":
-                case "MODIFIED":
-                    cache.put(event.getUid(), new RemoteInstance(new Address(event.getHost(), port, event.getUid().equals(this.uid))));
-                    break;
-                case "DELETED":
-                    cache.remove(event.getUid());
-                    break;
-                default:
-                    throw new RuntimeException(String.format("Unknown event %s", event.getType()));
-            }
+        if (log.isDebugEnabled()) {
+            List<String> uidList = pods
+                .stream()
+                .map(item -> item.getMetadata().getUid())
+                .collect(Collectors.toList());
+            log.debug("[kubernetes cluster pods uid list]:{}", uidList.toString());
         }
+
+        if (port == -1) {
+            port = manager.find(CoreModule.NAME).provider().getService(ConfigService.class).getGRPCPort();
+        }
+
+        return pods.stream()
+                   .map(pod -> new RemoteInstance(
+                       new Address(pod.getStatus().getPodIP(), port, pod.getMetadata().getUid().equals(uid))))
+                   .collect(Collectors.toList());
+
     }
 
-    @Override public List<RemoteInstance> queryRemoteNodes() {
-        logger.debug("Query kubernetes remote nodes: {}", cache);
-        return Lists.newArrayList(cache.values());
+    @Override
+    public void registerRemote(final RemoteInstance remoteInstance) throws ServiceRegisterException {
+        this.port = remoteInstance.getAddress().getPort();
+    }
+
+    private List<V1Pod> selfPod() {
+
+        V1Pod v1Pod = new V1Pod();
+        v1Pod.setMetadata(new V1ObjectMeta());
+        v1Pod.setStatus(new V1PodStatus());
+        v1Pod.getMetadata().setUid(uid);
+        v1Pod.getStatus().setPodIP("127.0.0.1");
+        return Collections.singletonList(v1Pod);
+
     }
 }

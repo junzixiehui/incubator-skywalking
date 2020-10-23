@@ -19,44 +19,40 @@
 package org.apache.skywalking.aop.server.receiver.mesh;
 
 import io.grpc.stub.StreamObserver;
-import org.apache.skywalking.apm.network.servicemesh.*;
+import org.apache.skywalking.apm.network.servicemesh.v3.MeshProbeDownstream;
+import org.apache.skywalking.apm.network.servicemesh.v3.ServiceMeshMetric;
+import org.apache.skywalking.apm.network.servicemesh.v3.ServiceMeshMetricServiceGrpc;
 import org.apache.skywalking.oap.server.library.module.ModuleManager;
-import org.apache.skywalking.oap.server.telemetry.TelemetryModule;
-import org.apache.skywalking.oap.server.telemetry.api.*;
-import org.slf4j.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class MeshGRPCHandler extends ServiceMeshMetricServiceGrpc.ServiceMeshMetricServiceImplBase {
-    private static final Logger logger = LoggerFactory.getLogger(MeshGRPCHandler.class);
-
-    private HistogramMetric histogram;
+    private static final Logger LOGGER = LoggerFactory.getLogger(MeshGRPCHandler.class);
 
     public MeshGRPCHandler(ModuleManager moduleManager) {
-        MetricCreator metricCreator = moduleManager.find(TelemetryModule.NAME).provider().getService(MetricCreator.class);
-        histogram = metricCreator.createHistogramMetric("mesh_grpc_in_latency", "The process latency of service mesh telemetry",
-            MetricTag.EMPTY_KEY, MetricTag.EMPTY_VALUE);
+
     }
 
     @Override
     public StreamObserver<ServiceMeshMetric> collect(StreamObserver<MeshProbeDownstream> responseObserver) {
         return new StreamObserver<ServiceMeshMetric>() {
-            @Override public void onNext(ServiceMeshMetric metric) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("Received mesh metric: {}", metric);
+            @Override
+            public void onNext(ServiceMeshMetric metrics) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("Received mesh metrics: {}", metrics);
                 }
-                HistogramMetric.Timer timer = histogram.createTimer();
-                try {
-                    TelemetryDataDispatcher.preProcess(metric);
-                } finally {
-                    timer.finish();
-                }
+
+                TelemetryDataDispatcher.process(metrics.toBuilder());
             }
 
-            @Override public void onError(Throwable throwable) {
-                logger.error(throwable.getMessage(), throwable);
+            @Override
+            public void onError(Throwable throwable) {
+                LOGGER.error(throwable.getMessage(), throwable);
                 responseObserver.onCompleted();
             }
 
-            @Override public void onCompleted() {
+            @Override
+            public void onCompleted() {
                 responseObserver.onNext(MeshProbeDownstream.newBuilder().build());
                 responseObserver.onCompleted();
             }
